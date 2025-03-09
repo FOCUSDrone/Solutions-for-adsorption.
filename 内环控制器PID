@@ -1,0 +1,172 @@
+/* 增强型PID控制器结构体 */
+typedef struct {
+    // 基本参数
+    float kp;                  // 比例系数
+    float ki;                  // 积分系数
+    float kd;                  // 微分系数
+    float kff;                 // 前馈系数
+    
+    // 控制范围
+    float minOutput;           // 输出下限
+    float maxOutput;           // 输出上限
+    float maxIntegral;         // 积分上限
+    
+    // 状态变量
+    float setpoint;            // 设定值
+    float measurement;         // 测量值
+    float lastMeasurement;     // 上次测量值
+    float integral;            // 积分项
+    float lastError;           // 上次误差
+    
+    // 增强功能参数
+    float integralSeparationThreshold; // 积分分离阈值
+    float deadBand;            // 死区大小
+    bool useVariableIntegral;  // 是否使用变速积分
+    bool useDerivativePV;      // 是否对测量值求微分
+    
+    // 输出滤波
+    float outputFilter;        // 输出滤波系数(0-1)
+    float lastOutput;          // 上次输出值
+    
+    // 性能指标
+    float maxError;            // 最大误差
+    float sumSquaredError;     // 误差平方和
+    int sampleCount;           // 样本数量
+} EnhancedPIDController_t;
+
+/* 初始化增强型PID控制器 */
+void InitEnhancedPIDController(EnhancedPIDController_t *pid, 
+                              float kp, float ki, float kd, float kff)
+{
+    // 设置基本参数
+    pid->kp = kp;
+    pid->ki = ki;
+    pid->kd = kd;
+    pid->kff = kff;
+    
+    // 设置默认限制
+    pid->minOutput = 0.0f;
+    pid->maxOutput = 1.0f;
+    pid->maxIntegral = 1000.0f;
+    
+    // 初始化状态变量
+    pid->setpoint = 0.0f;
+    pid->measurement = 0.0f;
+    pid->lastMeasurement = 0.0f;
+    pid->integral = 0.0f;
+    pid->lastError = 0.0f;
+    
+    // 设置增强功能参数
+    pid->integralSeparationThreshold = 10.0f;
+    pid->deadBand = 0.02f;
+    pid->useVariableIntegral = true;
+    pid->useDerivativePV = true;
+    
+    // 设置输出滤波
+    pid->outputFilter = 0.1f;  // 10%新值 + 90%旧值
+    pid->lastOutput = 0.0f;
+    
+    // 初始化性能指标
+    pid->maxError = 0.0f;
+    pid->sumSquaredError = 0.0f;
+    pid->sampleCount = 0;
+}
+
+/* 更新增强型PID控制器 */
+float UpdateEnhancedPIDController(EnhancedPIDController_t *pid, 
+                                 float setpoint, float measurement, float dt)
+{
+    // 更新设定值和测量值
+    pid->setpoint = setpoint;
+    pid->measurement = measurement;
+    
+    // 计算误差
+    float error = pid->setpoint - pid->measurement;
+    
+    // 更新性能指标
+    pid->maxError = fmaxf(pid->maxError, fabsf(error));
+    pid->sumSquaredError += error * error;
+    pid->sampleCount++;
+    
+    // 比例项
+    float pTerm = pid->kp * error;
+    
+    // 积分项(带积分分离和变速积分)
+    float iTerm = 0.0f;
+    if (fabsf(error) < pid->integralSeparationThreshold) {
+        // 积分分离：误差小于阈值时才启用积分作用
+        if (pid->useVariableIntegral) {
+            // 变速积分：误差越大，积分作用越小
+            float integralFactor = (pid->integralSeparationThreshold - fabsf(error)) / 
+                                  pid->integralSeparationThreshold;
+            pid->integral += pid->ki * error * integralFactor * dt;
+        } else {
+            // 常规积分
+            pid->integral += pid->ki * error * dt;
+        }
+        
+        // 积分限幅
+        if (pid->integral > pid->maxIntegral)
+            pid->integral = pid->maxIntegral;
+        if (pid->integral < -pid->maxIntegral)
+            pid->integral = -pid->maxIntegral;
+        
+        iTerm = pid->integral;
+    }
+    
+    // 微分项(可选择对测量值求微分)
+    float dTerm = 0.0f;
+    if (pid->useDerivativePV) {
+        // 对测量值求微分(微分先行)
+        float derivativePV = (pid->measurement - pid->lastMeasurement) / dt;
+        dTerm = -pid->kd * derivativePV;  // 注意负号
+    } else {
+        // 对误差求微分(传统方式)
+        float derivativeError = (error - pid->lastError) / dt;
+        dTerm = pid->kd * derivativeError;
+    }
+    
+    // 前馈项
+    float ffTerm = pid->kff * pid->setpoint;
+    
+    // 计算PID输出
+    float output = pTerm + iTerm + dTerm + ffTerm;
+    
+    // 死区补偿
+    if (fabsf(output) < pid->deadBand) {
+        if (output > 0) 
+            output = pid->deadBand;
+        else if (output < 0) 
+            output = -pid->deadBand;
+    }
+    
+    // 输出限幅
+    if (output > pid->maxOutput)
+        output = pid->maxOutput;
+    if (output < pid->minOutput)
+        output = pid->minOutput;
+    
+    // 输出滤波
+    output = output * (1.0f - pid->outputFilter) + pid->lastOutput * pid->outputFilter;
+    pid->lastOutput = output;
+    
+    // 更新上次测量值和误差
+    pid->lastMeasurement = pid->measurement;
+    pid->lastError = error;
+    
+    // 返回控制输出
+    return output;
+}
+
+/* 计算控制器性能指标 */
+void CalculatePIDPerformance(EnhancedPIDController_t *pid, 
+                            float *maxError, float *rmse)
+{
+    *maxError = pid->maxError;
+    
+    if (pid->sampleCount > 0) {
+        *rmse = sqrtf(pid->sumSquaredError / pid->sampleCount);
+    } else {
+        *rmse = 0.0f;
+    }
+}
