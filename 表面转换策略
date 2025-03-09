@@ -1,0 +1,184 @@
+/* 表面转换控制 */
+void SurfaceTransitionControl(SurfaceTransitionType_t transitionType)
+{
+    // 定义转换参数
+    const float TRANSITION_SAFETY_FACTOR = 1.5f;  // 转换安全系数
+    const float RAMP_RATE = 10.0f;               // 压力变化率(kPa/s)
+    
+    // 获取当前状态
+    SensorData_t currentData;
+    GetLatestSensorData(&currentData);
+    
+    // 目标压力值
+    float targetPressure[3] = {0};
+    
+    switch (transitionType) {
+        case TRANSITION_FLAT_TO_CURVED:
+            // 平面到曲面过渡
+            // 1. 增加吸附力
+            {
+                float force = CalculateAdaptiveAdsorptionForce(&currentData);
+                force *= TRANSITION_SAFETY_FACTOR;  // 增加安全系数
+                
+                // 计算目标压力
+                CalculateTargetPressure(force, 0.01f, 3, targetPressure);
+                
+                // 缓慢增加吸附力
+                RampPressureTo(targetPressure, RAMP_RATE);
+            }
+            break;
+            
+        case TRANSITION_CURVED_TO_FLAT:
+            // 曲面到平面过渡
+            // 1. 逐步减小吸附力到适合平面的水平
+            {
+                // 模拟平面数据
+                SensorData_t flatSurfaceData = currentData;
+                flatSurfaceData.curvatureRadius = 100.0f;  // 近似平面
+                
+                float force = CalculateAdaptiveAdsorptionForce(&flatSurfaceData);
+                
+                // 计算目标压力
+                CalculateTargetPressure(force, 0.01f, 3, targetPressure);
+                
+                // 缓慢调整吸附力
+                RampPressureTo(targetPressure, RAMP_RATE * 0.5f);  // 较慢的变化率
+            }
+            break;
+            
+        case TRANSITION_INCREASING_CURVATURE:
+            // 进入曲率增加区域
+            // 1. 预先增加吸附力
+            {
+                // 预测更大曲率
+                SensorData_t predictedData = currentData;
+                predictedData.curvatureRadius = fmaxf(currentData.curvatureRadius * 0.7f, 0.5f);
+                
+                float force = CalculateAdaptiveAdsorptionForce(&predictedData);
+                
+                // 计算目标压力
+                CalculateTargetPressure(force, 0.01f, 3, targetPressure);
+                
+                // 快速调整吸附力
+                RampPressureTo(targetPressure, RAMP_RATE * 1.5f);  // 较快的变化率
+            }
+            break;
+            
+        case TRANSITION_DECREASING_CURVATURE:
+            // 进入曲率减小区域
+            // 维持当前吸附力，然后缓慢适应
+            // 这里不做特殊处理，让正常自适应控制来处理
+            break;
+            
+        case TRANSITION_MATERIAL_CHANGE:
+            // 材料变化(如粗糙度、摩擦系数变化)
+            // 1. 临时增加吸附力确保过渡安全
+            {
+                float force = CalculateAdaptiveAdsorptionForce(&currentData);
+                force *= 1.3f;  // 30%安全余量
+                
+                // 计算目标压力
+                CalculateTargetPressure(force, 0.01f, 3, targetPressure);
+                
+                // 快速调整吸附力
+                RampPressureTo(targetPressure, RAMP_RATE * 2.0f);  // 快速变化
+                
+                // 2. 短暂维持增强吸附力
+                vTaskDelay(pdMS_TO_TICKS(500));
+                
+                // 3. 采集新表面数据
+                GetLatestSensorData(&currentData);
+                
+                // 4. 计算新的适应吸附力
+                force = CalculateAdaptiveAdsorptionForce(&currentData);
+                
+                // 计算新的目标压力
+                CalculateTargetPressure(force, 0.01f, 3, targetPressure);
+                
+                // 5. 调整到新的吸附力水平
+                RampPressureTo(targetPressure, RAMP_RATE);
+            }
+            break;
+            
+        default:
+            break;
+    }
+    
+    // 转换过程中持续监测
+    uint32_t transitionStartTime = HAL_GetTick();
+    while (HAL_GetTick() - transitionStartTime < 3000) {  // 3秒转换期
+        // 监测压力和姿态
+        GetLatestSensorData(&currentData);
+        
+        // 检查是否有异常
+        if (DetectAbnormalParameters(&currentData)) {
+            // 异常处理
+            HandleEmergencySituation(EMERGENCY_TRANSITION_FAILURE);
+            return;
+        }
+        
+        // 短暂延时
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    
+    // 转换完成
+    SendInfoMessage("Surface transition completed successfully");
+}
+
+/* 缓慢调整压力到目标值 */
+void RampPressureTo(float *targetPressure, float rampRate)
+{
+    // 获取当前压力
+    float currentPressure[3];
+    for (int i = 0; i < 3; i++) {
+        currentPressure[i] = GetPressure(i);
+    }
+    
+    // 计算所需时间
+    float maxDifference = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float difference = fabs(targetPressure[i] - currentPressure[i]);
+        if (difference > maxDifference) {
+            maxDifference = difference;
+        }
+    }
+    
+    // 计算所需时间(ms)
+    uint32_t rampTime = (uint32_t)((maxDifference / rampRate) * 1000.0f);
+    uint32_t startTime = HAL_GetTick();
+    uint32_t currentTime;
+    
+    // 逐步调整压力
+    while ((currentTime = HAL_GetTick()) - startTime < rampTime) {
+        // 计算当前进度(0-1)
+        float progress = (float)(currentTime - startTime) / (float)rampTime;
+        if (progress > 1.0f) progress = 1.0f;
+        
+        // 计算当前目标
+        float intermediatePressure[3];
+        for (int i = 0; i < 3; i++) {
+            intermediatePressure[i] = currentPressure[i] + 
+                                    (targetPressure[i] - currentPressure[i]) * progress;
+            
+            // 更新PID控制器
+            float pwm = UpdateEnhancedPIDController(&pidControllers[i], 
+                                                  intermediatePressure[i], 
+                                                  GetPressure(i), 
+                                                  0.02f);
+            SetFanPWM(i, pwm);
+        }
+        
+        // 短暂延时
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    
+    // 设置最终目标
+    for (int i = 0; i < 3; i++) {
+        // 更新PID控制器
+        float pwm = UpdateEnhancedPIDController(&pidControllers[i], 
+                                              targetPressure[i], 
+                                              GetPressure(i), 
+                                              0.02f);
+        SetFanPWM(i, pwm);
+    }
+}
