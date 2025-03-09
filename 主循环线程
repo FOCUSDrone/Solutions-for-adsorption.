@@ -1,0 +1,95 @@
+/**
+ * @brief 吸附控制任务
+ * @param pvParameters FreeRTOS任务参数
+ */
+void AdsorptionControlTask(void *pvParameters)
+{
+    // 系统初始化
+    InitAdsorptionSystem();
+    
+    // 系统启动
+    if (!AdsorptionSystemStartup()) {
+        LOG_ERROR("Adsorption system startup failed");
+        // 设置错误状态
+        SetSystemState(STATE_ERROR);
+        // 持续进行安全监测
+        while (1) {
+            BasicSafetyMonitoring();
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    
+    // 主控制循环
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xPeriod = pdMS_TO_TICKS(10);  // 10ms控制周期 (100Hz)
+    
+    while (1) {
+        // 1. 获取传感器数据
+        SensorData_t sensorData;
+        if (GetLatestSensorData(&sensorData) != HAL_OK) {
+            LOG_WARNING("Failed to get sensor data");
+            BasicSafetyMonitoring();
+            vTaskDelayUntil(&xLastWakeTime, xPeriod);
+            continue;
+        }
+        
+        // 2. 安全检查
+        SafetyStatus_t safetyStatus = CheckSafetyStatus();
+        if (safetyStatus != SAFETY_OK) {
+            // 处理安全问题
+            HandleSafetyIssue(safetyStatus);
+            // 安全问题优先处理，本周期跳过正常控制
+            vTaskDelayUntil(&xLastWakeTime, xPeriod);
+            continue;
+        }
+        
+        // 3. 检测表面状态变化
+        SurfaceState_t surfaceState = DetectSurfaceState(&sensorData);
+        if (surfaceState != currentSurfaceState) {
+            // 表面状态变化，执行转换控制
+            SurfaceTransitionType_t transitionType = 
+                DetermineSurfaceTransitionType(currentSurfaceState, surfaceState);
+            SurfaceTransitionControl(transitionType);
+            currentSurfaceState = surfaceState;
+        }
+        
+        // 4. 计算自适应吸附力
+        float adsorptionForce = CalculateAdaptiveAdsorptionForce(&sensorData);
+        
+        // 5. 计算目标负压
+        float targetPressure[3] = {0};
+        CalculateTargetPressure(adsorptionForce, CHAMBER_AREA, 3, targetPressure);
+        
+        // 6. 获取系统状态并调整PID参数
+        SystemState_t systemState = GetSystemState();
+        for (int i = 0; i < 3; i++) {
+            AdjustPIDParameters(&pidControllers[i], targetPressure[i], systemState);
+        }
+        
+        // 7. 执行PID控制
+        for (int i = 0; i < 3; i++) {
+            float currentPressure = GetPressure(i);
+            
+            // 更新PID控制器
+            float pwm = UpdateEnhancedPIDController(&pidControllers[i], 
+                                                  targetPressure[i], 
+                                                  currentPressure, 
+                                                  0.01f);  // dt = 10ms
+            
+            // 设置风扇PWM
+            SetFanPWM(i, pwm);
+        }
+        
+        // 8. 监测控制性能
+        MonitorControlPerformance();
+        
+        // 9. 发送状态更新
+        if (statusUpdateCounter++ >= 10) {  // 每100ms发送一次
+            SendStatusUpdate(&sensorData, targetPressure);
+            statusUpdateCounter = 0;
+        }
+        
+        // 精确周期控制
+        vTaskDelayUntil(&xLastWakeTime, xPeriod);
+    }
+}
