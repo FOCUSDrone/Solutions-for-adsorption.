@@ -1,0 +1,103 @@
+/* 自适应吸附力计算函数 */
+float CalculateAdaptiveAdsorptionForce(SensorData_t *sensorData)
+{
+    // 系统参数
+    const float ROBOT_MASS = 10.0f;                  // 机器人质量(kg)
+    const float GRAVITY_ACC = 9.81f;                 // 重力加速度(m/s²)
+    const float SAFETY_FACTOR = 3.5f;                // 安全系数
+    const float ROLL_COMP_FACTOR = 0.35f;            // 横滚角补偿系数
+    const float PITCH_COMP_FACTOR = 0.35f;           // 俯仰角补偿系数
+    const float UPWARD_MOTION_FACTOR = 1.8f;         // 上行运动补偿系数
+    const float LATERAL_MOTION_FACTOR = 1.0f;        // 横向运动补偿系数
+    const float DYNAMIC_MOTION_FACTOR = 0.5f;        // 动态运动补偿系数
+    const float CURVATURE_FACTOR = 1.5f;             // 曲率补偿系数
+    
+    // 1. 计算基础吸附力
+    float baseForce = ROBOT_MASS * GRAVITY_ACC * SAFETY_FACTOR;
+    
+    // 2. 姿态补偿计算
+    // 将角度转换为弧度
+    float rollRad = sensorData->roll * 0.01745329251f;  // π/180
+    float pitchRad = sensorData->pitch * 0.01745329251f;
+    
+    float attitudeComp = ROBOT_MASS * GRAVITY_ACC * 
+        (ROLL_COMP_FACTOR * fabsf(sinf(rollRad)) + 
+         PITCH_COMP_FACTOR * fabsf(sinf(pitchRad)));
+    
+    // 3. 运动状态补偿
+    // 首先计算重力分量在各轴上的投影并补偿
+    float gravityCompX = GRAVITY_ACC * sinf(pitchRad);
+    float gravityCompY = GRAVITY_ACC * sinf(rollRad);
+    float gravityCompZ = GRAVITY_ACC * cosf(sqrtf(pitchRad*pitchRad + rollRad*rollRad));
+    
+    // 补偿后的加速度
+    float accelXComp = sensorData->accelX - gravityCompX;
+    float accelYComp = sensorData->accelY - gravityCompY;
+    float accelZComp = sensorData->accelZ - gravityCompZ;
+    
+    // 合加速度大小
+    float totalAccel = sqrtf(accelXComp*accelXComp + 
+                             accelYComp*accelYComp + 
+                             accelZComp*accelZComp);
+    
+    // 上行运动补偿(Y轴正向为上)
+    float upwardComp = ROBOT_MASS * UPWARD_MOTION_FACTOR * 
+                       fmaxf(0.0f, accelYComp);
+    
+    // 横向运动补偿(X轴)
+    float lateralComp = ROBOT_MASS * LATERAL_MOTION_FACTOR * 
+                        fabsf(accelXComp);
+    
+    // 动态运动补偿(考虑整体加速度变化)
+    float dynamicComp = ROBOT_MASS * DYNAMIC_MOTION_FACTOR * 
+                        fmaxf(0.0f, totalAccel - GRAVITY_ACC);
+    
+    float motionComp = upwardComp + lateralComp + dynamicComp;
+    
+    // 4. 曲率补偿
+    // 限制最小曲率半径为0.5m(防止除零)
+    float curvatureRadius = fmaxf(sensorData->curvatureRadius, 0.5f);
+    float curvatureComp = ROBOT_MASS * GRAVITY_ACC * CURVATURE_FACTOR * 
+                          (1.0f / curvatureRadius);
+    
+    // 限制曲率补偿上限
+    curvatureComp = fminf(curvatureComp, ROBOT_MASS * GRAVITY_ACC * 2.0f);
+    
+    // 5. 总吸附力计算
+    float totalForce = baseForce + attitudeComp + motionComp + curvatureComp;
+    
+    // 6. 记录详细计算过程(用于调试与优化)
+    #ifdef DEBUG_MODE
+    printf("Force Calculation:\n");
+    printf("Base:     %.2f N\n", baseForce);
+    printf("Attitude: %.2f N\n", attitudeComp);
+    printf("Motion:   %.2f N (Up:%.2f, Lat:%.2f, Dyn:%.2f)\n", 
+           motionComp, upwardComp, lateralComp, dynamicComp);
+    printf("Curvature:%.2f N (R=%.2fm)\n", curvatureComp, curvatureRadius);
+    printf("Total:    %.2f N\n", totalForce);
+    #endif
+    
+    return totalForce;
+}
+
+/* 目标负压计算函数 */
+void CalculateTargetPressure(float totalForce, float chamberArea, 
+                            int chamberCount, float *targetPressure)
+{
+    // 计算每个吸附腔所需的负压
+    float forcePerChamber = totalForce / (float)chamberCount;
+    float pressure = -forcePerChamber / chamberArea;  // 负值表示负压
+    
+    // 负压范围限制(-100kPa是物理极限)
+    const float MIN_PRESSURE = -95.0f * 1000.0f;  // -95 kPa转换为Pa
+    const float MAX_PRESSURE = -10.0f * 1000.0f;  // -10 kPa转换为Pa
+    
+    pressure = fmaxf(pressure, MIN_PRESSURE);
+    pressure = fminf(pressure, MAX_PRESSURE);
+    
+    // 转换为kPa并应用到所有吸附腔
+    float pressureKPa = pressure / 1000.0f;
+    for (int i = 0; i < chamberCount; i++) {
+        targetPressure[i] = pressureKPa;
+    }
+}
