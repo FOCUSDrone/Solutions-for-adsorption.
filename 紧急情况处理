@@ -1,0 +1,183 @@
+/**
+ * @brief 紧急情况处理函数
+ * @param emergencyType 紧急情况类型
+ */
+void HandleEmergencySituation(EmergencyType_t emergencyType)
+{
+    // 记录紧急情况
+    LogEvent(EVENT_EMERGENCY, (uint32_t)emergencyType);
+    
+    // 设置系统状态
+    SetSystemState(STATE_EMERGENCY);
+    
+    LOG_ERROR("EMERGENCY: %s", GetEmergencyTypeName(emergencyType));
+    
+    // 根据紧急情况类型处理
+    switch (emergencyType) {
+        case EMERGENCY_PRESSURE_LOSS:
+            // 压力急剧下降处理
+            HandlePressureLossEmergency();
+            break;
+            
+        case EMERGENCY_FAN_FAILURE:
+            // 风扇故障处理
+            HandleFanFailureEmergency();
+            break;
+            
+        case EMERGENCY_POWER_LOW:
+            // 电源电压低处理
+            HandleLowPowerEmergency();
+            break;
+            
+        case EMERGENCY_RAPID_ATTITUDE_CHANGE:
+            // 姿态突变(可能脱离表面)
+            HandleRapidAttitudeChangeEmergency();
+            break;
+            
+        case EMERGENCY_TRANSITION_FAILURE:
+            // 表面转换失败
+            HandleTransitionFailureEmergency();
+            break;
+            
+        default:
+            // 默认紧急处理
+            HandleDefaultEmergency();
+            break;
+    }
+    
+    // 紧急情况响应后续处理
+    EmergencyRecoveryProcess();
+}
+
+/**
+ * @brief 处理压力损失紧急情况
+ */
+void HandlePressureLossEmergency(void)
+{
+    LOG_ERROR("Pressure loss emergency handling");
+    
+    // 1. 所有风扇最大功率
+    for (int i = 0; i < 3; i++) {
+        SetFanPWM(i, 1.0f);  // 100% PWM
+    }
+    
+    // 2. 发送紧急停止命令给运动控制系统
+    SendEmergencyStopCommand();
+    
+    // 3. 通知上位机
+    SendEmergencyMessage("CRITICAL: Pressure loss detected!");
+    
+    // 4. 获取详细诊断信息
+    SensorData_t currentData;
+    GetLatestSensorData(&currentData);
+    
+    LOG_ERROR("Pressure values: P1=%.2f, P2=%.2f, P3=%.2f", 
+             currentData.pressure[0], currentData.pressure[1], currentData.pressure[2]);
+}
+
+/**
+ * @brief 处理风扇故障紧急情况
+ */
+void HandleFanFailureEmergency(void)
+{
+    // 1. 诊断哪个风扇故障
+    uint8_t failedFan = DiagnoseFanFailure();
+    LOG_ERROR("Fan %d failure detected", failedFan);
+    
+    // 2. 关闭故障风扇
+    SetFanPWM(failedFan, 0.0f);
+    
+    // 3. 增加其他风扇功率补偿
+    for (int i = 0; i < 3; i++) {
+        if (i != failedFan) {
+            float currentPWM = GetFanPWM(i);
+            float newPWM = fminf(currentPWM * 1.5f, 1.0f);
+            LOG_INFO("Increasing fan %d PWM from %.2f to %.2f", i, currentPWM, newPWM);
+            SetFanPWM(i, newPWM);
+        }
+    }
+    
+    // 4. 通知上位机
+    char message[50];
+    sprintf(message, "WARNING: Fan %d failure! Compensating...", failedFan);
+    SendWarningMessage(message);
+    
+    // 5. 降低运动速度要求
+    RequestReducedMovementSpeed();
+}
+
+/**
+ * @brief 紧急情况恢复流程
+ */
+void EmergencyRecoveryProcess(void)
+{
+    // 1. 等待状态稳定
+    LOG_INFO("Waiting for system stabilization");
+    uint32_t stabilizationStartTime = HAL_GetTick();
+    const uint32_t STABILIZATION_TIMEOUT = 5000;  // 5秒超时
+    
+    bool stabilized = false;
+    while (HAL_GetTick() - stabilizationStartTime < STABILIZATION_TIMEOUT) {
+        // 持续监测关键参数
+        SensorData_t currentData;
+        GetLatestSensorData(&currentData);
+        
+        // 检查是否稳定
+        if (IsSystemStable(&currentData)) {
+            LOG_INFO("System stabilized after emergency");
+            stabilized = true;
+            break;
+        }
+        
+        // 短暂延时
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    if (!stabilized) {
+        LOG_WARNING("System did not stabilize within timeout");
+    }
+    
+    // 2. 评估系统状态
+    SystemStatusType_t systemStatus = EvaluateSystemStatus();
+    
+    // 3. 根据评估结果进行恢复
+    switch (systemStatus) {
+        case STATUS_NORMAL:
+            // 完全恢复
+            LOG_INFO("System recovered to normal status");
+            SetSystemState(STATE_NORMAL);
+            break;
+            
+        case STATUS_DEGRADED:
+            // 降级模式
+            LOG_WARNING("System recovered to degraded mode");
+            SetSystemState(STATE_DEGRADED);
+            // 设置降级参数
+            SetDegradedModeParameters();
+            break;
+            
+        case STATUS_RECOVERABLE:
+            // 需要重启恢复
+            LOG_WARNING("System requires restart to recover");
+            SendWarningMessage("System requires restart to recover");
+            // 尝试重启
+            if (RestartAdsorptionSystem()) {
+                LOG_INFO("System restarted successfully");
+            } else {
+                LOG_ERROR("System restart failed");
+                SetSystemState(STATE_ERROR);
+            }
+            break;
+            
+        case STATUS_CRITICAL:
+            // 无法恢复
+            LOG_ERROR("System cannot recover from emergency");
+            SetSystemState(STATE_ERROR);
+            SendErrorMessage("System unable to recover. Manual intervention required.");
+            break;
+            
+        default:
+            SetSystemState(STATE_ERROR);
+            break;
+    }
+}
