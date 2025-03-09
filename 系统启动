@@ -1,0 +1,167 @@
+/**
+ * @brief 吸附系统启动控制
+ * @return 启动是否成功
+ */
+bool AdsorptionSystemStartup(void)
+{
+    // 定义启动阶段
+    typedef enum {
+        STARTUP_PHASE_INIT,       // 初始化
+        STARTUP_PHASE_PRECHARGE,  // 预充气
+        STARTUP_PHASE_RAMPUP,     // 逐步增加吸附
+        STARTUP_PHASE_STABILIZE,  // 稳定化
+        STARTUP_PHASE_COMPLETE    // 完成
+    } StartupPhase_t;
+    
+    // 启动参数
+    const uint32_t PRECHARGE_TIME = 500;   // 预充气时间(ms)
+    const uint32_t RAMPUP_TIME = 2000;     // 斜坡上升时间(ms)
+    const uint32_t STABILIZE_TIME = 1000;  // 稳定化时间(ms)
+    const float INITIAL_PRESSURE = -10.0f; // 初始负压(kPa)
+    const float TARGET_PRESSURE = -50.0f;  // 目标负压(kPa)
+    
+    // 初始化变量
+    StartupPhase_t currentPhase = STARTUP_PHASE_INIT;
+    uint32_t phaseStartTime = HAL_GetTick();
+    uint32_t currentTime;
+    float targetPressure[3] = {0};
+    bool startupSuccess = false;
+    
+    LOG_INFO("Starting adsorption system...");
+    
+    // 启动顺序执行
+    while (currentPhase != STARTUP_PHASE_COMPLETE) {
+        currentTime = HAL_GetTick();
+        
+        switch (currentPhase) {
+            case STARTUP_PHASE_INIT:
+                // 初始化系统
+                LOG_INFO("Startup phase: Initialization");
+                InitAdsorptionSystem();
+                currentPhase = STARTUP_PHASE_PRECHARGE;
+                phaseStartTime = currentTime;
+                break;
+                
+            case STARTUP_PHASE_PRECHARGE:
+                // 预充气阶段：轻微负压，检查系统响应
+                for (int i = 0; i < 3; i++) {
+                    targetPressure[i] = INITIAL_PRESSURE;
+                    SetFanPWM(i, 0.3f);  // 30% PWM
+                }
+                
+                // 检查是否达到预充气时间
+                if (currentTime - phaseStartTime >= PRECHARGE_TIME) {
+                    // 检查所有压力传感器是否正常响应
+                    bool sensorsResponding = true;
+                    for (int i = 0; i < 3; i++) {
+                        if (fabsf(GetPressure(i)) < 2.0f) {  // 小于2kPa认为没响应
+                            sensorsResponding = false;
+                            LOG_WARNING("Pressure sensor %d not responding", i);
+                            break;
+                        }
+                    }
+                    
+                    if (sensorsResponding) {
+                        LOG_INFO("Startup phase: Ramp-up");
+                        currentPhase = STARTUP_PHASE_RAMPUP;
+                        phaseStartTime = currentTime;
+                    } else {
+                        // 传感器无响应，重试
+                        LOG_WARNING("Sensor not responding, reinitializing...");
+                        if (currentTime - phaseStartTime >= PRECHARGE_TIME * 3) {
+                            // 超时处理
+                            LOG_ERROR("Startup failed: Sensor not responding");
+                            return false;
+                        }
+                    }
+                }
+                break;
+                
+            case STARTUP_PHASE_RAMPUP:
+                // 线性增加吸附力
+                {
+                    float progress = (float)(currentTime - phaseStartTime) / RAMPUP_TIME;
+                    progress = progress > 1.0f ? 1.0f : progress;  // 限制在0-1范围
+                    
+                    // 计算当前目标压力(从INITIAL_PRESSURE到TARGET_PRESSURE)
+                    float currentTarget = INITIAL_PRESSURE + 
+                                        (TARGET_PRESSURE - INITIAL_PRESSURE) * progress;
+                    
+                    // 应用到所有吸附腔
+                    for (int i = 0; i < 3; i++) {
+                        targetPressure[i] = currentTarget;
+                        // 使用PID控制
+                        float pwm = UpdateEnhancedPIDController(&pidControllers[i], 
+                                                              targetPressure[i], 
+                                                              GetPressure(i), 
+                                                              0.01f);
+                        SetFanPWM(i, pwm);
+                    }
+                    
+                    // 检查是否达到斜坡上升时间
+                    if (progress >= 1.0f) {
+                        LOG_INFO("Startup phase: Stabilization");
+                        currentPhase = STARTUP_PHASE_STABILIZE;
+                        phaseStartTime = currentTime;
+                    }
+                }
+                break;
+                
+            case STARTUP_PHASE_STABILIZE:
+                // 稳定化阶段：保持稳定负压
+                {
+                    // 稳定在TARGET_PRESSURE
+                    for (int i = 0; i < 3; i++) {
+                        targetPressure[i] = TARGET_PRESSURE;
+                        // 使用PID控制
+                        float pwm = UpdateEnhancedPIDController(&pidControllers[i], 
+                                                              targetPressure[i], 
+                                                              GetPressure(i), 
+                                                              0.01f);
+                        SetFanPWM(i, pwm);
+                    }
+                    
+                    // 检查压力是否稳定
+                    bool pressureStable = true;
+                    for (int i = 0; i < 3; i++) {
+                        if (fabsf(GetPressure(i) - targetPressure[i]) > 5.0f) {
+                            pressureStable = false;
+                            break;
+                        }
+                    }
+                    
+                    // 检查是否达到稳定化时间
+                    if ((currentTime - phaseStartTime >= STABILIZE_TIME) && pressureStable) {
+                        LOG_INFO("Startup completed successfully");
+                        currentPhase = STARTUP_PHASE_COMPLETE;
+                        startupSuccess = true;
+                    }
+                }
+                break;
+                
+            default:
+                currentPhase = STARTUP_PHASE_COMPLETE;
+                break;
+        }
+        
+        // 安全检查
+        if (CheckSafetyStatus() != SAFETY_OK) {
+            LOG_ERROR("Startup aborted: Safety issue detected");
+            return false;
+        }
+        
+        // 适当延时
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // 启动完成，设置系统状态
+    if (startupSuccess) {
+        SetSystemState(STATE_NORMAL);
+        LOG_INFO("Adsorption system ready");
+    } else {
+        SetSystemState(STATE_ERROR);
+        LOG_ERROR("Adsorption system startup failed");
+    }
+    
+    return startupSuccess;
+}
